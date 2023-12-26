@@ -14,3 +14,7 @@ sha256 = "1.4.0"
 surrealdb = "1.0.2"
 thiserror = "1.0.52"
 tracing = "0.1.40"
+
+[dev-dependencies]
+tokio = { version = "1.35.1", features = ["macros", "rt"] }
+surrealdb = { version = "1.0.2", features = [ "kv-mem" ] }
