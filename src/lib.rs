@@ -278,7 +278,7 @@ impl<'a> Migrations<'a> {
 // Read user version field from the db
 async fn get_current_version<C: Connection>(db: &Surreal<C>) -> Result<usize, surrealdb::Error> {
     let mut result = db
-        .query(r#"SELECT version FROM _migrations ORDER BY version LIMIT 1"#)
+        .query(r#"SELECT version FROM _migrations ORDER BY version DESC LIMIT 1"#)
         .await?
         .check()?;
 
