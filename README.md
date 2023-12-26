@@ -20,7 +20,7 @@ migrations.to_latest(&db).unwrap();
 
 # LICENSE
 
-MIT
+Apache License
 
 # Acknowledgments
 
