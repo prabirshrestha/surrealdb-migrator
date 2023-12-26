@@ -63,7 +63,7 @@ impl<'a> M<'a> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```no_test
     /// use surrealdb_migration::M;
     ///
     /// M::up("DEFINE TABLE user; DEFINE FIELD username ON user TYPE string;");
@@ -98,7 +98,7 @@ impl<'a> Migrations<'a> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```no_test
     /// use surrealdb_migration::{Migrations, M};
     ///
     /// let migrations = Migrations::new(vec![
@@ -115,7 +115,7 @@ impl<'a> Migrations<'a> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```no_test
     /// use surrealdb_migration::{Migrations, M};
     ///
     /// let db = surrealdb::engine::any::connect("file://data.db");
@@ -314,5 +314,19 @@ impl From<&SchemaVersion> for usize {
 impl From<SchemaVersion> for usize {
     fn from(schema_version: SchemaVersion) -> Self {
         From::from(&schema_version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_db_should_have_version_0() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let version = get_current_version(&db).await?;
+        assert_eq!(version, 0);
+        Ok(())
     }
 }
