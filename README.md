@@ -4,8 +4,12 @@ Migrator library for [SurrealDB](https://surrealdb.com).
 
 # Example
 
+```bash
+cargo add surrealdb-migrator
+```
+
 ```rust
-use surrealdb_migration::{Migrations, M};
+use surrealdb_migrator::{Migrations, M};
 
 let db = surrealdb::engine::any::connect("...connection string...");
 
