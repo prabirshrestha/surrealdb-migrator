@@ -1,0 +1,15 @@
+[package]
+name = "surrealdb-migrator"
+version = "0.1.0"
+authors = ["Prabir Shrestha <mail@prabir.me>"]
+edition = "2021"
+license = "MIT"
+description = "SurrealDB migrator"
+repository = "https://github.com/prabirshrestha/surrealdb-migrator"
+readme = "README.md"
+
+[dependencies]
+sha256 = "1.4.0"
+surrealdb = "1.0.2"
+thiserror = "1.0.52"
+tracing = "0.1.40"
