@@ -320,6 +320,7 @@ impl From<SchemaVersion> for usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[tokio::test]
     async fn empty_db_should_have_version_0() -> Result<()> {
@@ -327,6 +328,53 @@ mod tests {
         db.use_ns("test").use_db("test").await?;
         let version = get_current_version(&db).await?;
         assert_eq!(version, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_with_no_migrations_defined_when_no_migrations() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![]);
+        let result = migrations.to_latest(&db).await;
+        matches!(
+            result,
+            Err(Error::MigrationDefinition(
+                MigrationDefinitionError::NoMigrationsDefined
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_migrations_table_is_created_when_run_migrations() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![]);
+        let _ = migrations.to_latest(&db).await;
+        let mut result = db.query("INFO FOR TABLE _migrations;").await?.check()?;
+        let result: Vec<Value> = result.take((0, "fields"))?;
+        assert_eq!(
+            &result[0]["checksum"],
+            "DEFINE FIELD checksum ON _migrations TYPE string PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["comment"],
+            "DEFINE FIELD comment ON _migrations TYPE string PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["installed_on"],
+            "DEFINE FIELD installed_on ON _migrations TYPE datetime PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["version"],
+            "DEFINE FIELD version ON _migrations TYPE number PERMISSIONS FULL"
+        );
+
+        let mut result = db.query("SELECT count() from _migrations").await?.check()?;
+        let query_result: Option<u64> = result.take((0, "count"))?;
+        assert_eq!(query_result.unwrap_or_default(), 0);
+
         Ok(())
     }
 }
