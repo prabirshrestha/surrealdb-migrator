@@ -317,6 +317,14 @@ impl From<SchemaVersion> for usize {
     }
 }
 
+impl<'u> FromIterator<M<'u>> for Migrations<'u> {
+    fn from_iter<T: IntoIterator<Item = M<'u>>>(iter: T) -> Self {
+        Self {
+            ms: Vec::from_iter(iter),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
