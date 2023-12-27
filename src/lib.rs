@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, num::NonZeroUsize};
+use std::{
+    cmp::{self, Ordering},
+    num::NonZeroUsize,
+};
 
 use surrealdb::{Connection, Surreal};
 use tracing::{debug, info, trace, warn};
@@ -17,11 +20,29 @@ pub enum Error {
         /// Error returned by surrealdb
         err: surrealdb::Error,
     },
+    #[error("Specified schema version error")]
+    /// Error with the specified schema version
+    SpecifiedSchemaVersion(SchemaVersionError),
     #[error("Migration definition error")]
     /// Something wrong with migration definitions
     MigrationDefinition(MigrationDefinitionError),
     #[error("Unrecognized error")]
     Unrecognized(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+/// Errors related to schema versions
+#[derive(thiserror::Error, Debug)]
+#[allow(clippy::enum_variant_names)]
+#[non_exhaustive]
+pub enum SchemaVersionError {
+    /// Attempt to migrate to a version out of range for the supplied migrations
+    #[error("Target version out of range")]
+    TargetVersionOutOfRange {
+        /// The attempt to migrate to this version caused the error
+        specified: SchemaVersion,
+        /// Highest version defined in the migration set
+        highest: SchemaVersion,
+    },
 }
 
 impl From<surrealdb::Error> for Error {
@@ -54,6 +75,7 @@ pub enum MigrationDefinitionError {
 #[derive(Debug)]
 pub struct M<'a> {
     up: &'a str,
+    down: Option<&'a str>,
     comment: Option<&'a str>,
 }
 
@@ -71,8 +93,27 @@ impl<'a> M<'a> {
     pub fn up(sql: &'a str) -> Self {
         Self {
             up: sql,
+            down: None,
             comment: None,
         }
+    }
+
+    /// Define a down-migration. This SQL statement should exactly reverse the changes
+    /// performed in `up()`.
+    ///
+    /// A call to this method is **not** required.
+    ///
+    /// # Example
+    ///
+    /// ```not_test
+    /// use surrealdb_migration::M;
+    ///
+    /// M::up("DEFINE TABLE animal; DEFINE FIELD name FOR animal TYPE string;")
+    ///     .down("REMOVE TABLE animal;");
+    /// ```
+    pub const fn down(mut self, sql: &'a str) -> Self {
+        self.down = Some(sql);
+        self
     }
 
     /// Add a comment to the schema update
@@ -83,7 +124,16 @@ impl<'a> M<'a> {
 
     /// Generate a sha256 checksum based on the up sql
     pub fn checksum(&self) -> String {
-        sha256::digest(self.up)
+        sha256::digest(format!("{}:{}", self.up, self.down.unwrap_or_default()))
+    }
+}
+
+impl cmp::PartialOrd for SchemaVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let self_usize: usize = self.into();
+        let other_usize: usize = other.into();
+
+        self_usize.partial_cmp(&other_usize)
     }
 }
 
@@ -147,6 +197,88 @@ impl<'a> Migrations<'a> {
                 self.goto(db, v_max.into()).await
             }
             SchemaVersion::Outside(_) => unreachable!(),
+        }
+    }
+
+    /// Migrate the database to a given schema version. The migrations are applied atomically.
+    ///
+    /// # Specifying versions
+    ///
+    /// - Empty database (no migrations run yet) has version `0`.
+    /// - The version increases after each migration, so after the first migration has run, the schema version is `1`. For instance, if there are 3 migrations, version `3` is after all migrations have run.
+    ///
+    /// *Note*: As a result, the version is the index in the migrations vector *starting from 1*.
+    ///
+    /// # Example
+    ///
+    /// ```no_test
+    /// use surrealdb_migration::{Migrations, M};
+    ///
+    /// let db = surrealdb::engine::any::connect("file://data.db");
+    /// let migrations = Migrations::new(vec![
+    ///     // 0: version 0, before having run any migration
+    ///     M::up("DEFINE TABLE animal; DEFINE FIELD name on animal TYPE string;").down("REMOVE TABLE animal;"),
+    ///     // 1: version 1, after having created the “animals” table
+    ///     M::up("DEFINE TABLE food; DEFINE FIELD name on food TYPE string;").down("REMOVE TABLE food;"),
+    ///     // 2: version 2, after having created the food table
+    /// ]);
+    ///
+    /// migrations.to_latest(&db).await?; // Create all tables
+    ///
+    /// // Go back to version 1, i.e. after running the first migration
+    /// migrations.to_version(&db, 1).await?;
+    /// db.query("INSERT INTO animal { name: 'dog' }").await?.check()?;
+    /// db.query("INSERT INTO food { name: 'carrot' }").await?.check()?;
+    ///
+    /// // Go back to an empty database
+    /// migrations.to_version(&db, 0).await?;
+    /// db.query("INSERT INTO animal { name: 'cat' }").await?.check()?;
+    /// db.query("INSERT INTO food { name: 'milk' }").await?.check()?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Attempts to migrate to a higher version than is supported will result in an error.
+    ///
+    /// When migrating downwards, all the reversed migrations must have a `.down()` variant,
+    /// otherwise no migrations are run and the function returns an error.
+    pub async fn to_version<C: Connection>(&self, db: &Surreal<C>, version: usize) -> Result<()> {
+        let target_version: SchemaVersion = self.db_version_to_schema(version);
+        let v_max = self.max_schema_version();
+        match v_max {
+            SchemaVersion::NoneSet => {
+                warn!("no migrations defined");
+                Err(Error::MigrationDefinition(
+                    MigrationDefinitionError::NoMigrationsDefined,
+                ))
+            }
+            SchemaVersion::Inside(v) => {
+                debug!("some migrations defined (version: {v}), try to migrate");
+                if target_version > v_max {
+                    warn!("specified version is higher than the max supported version");
+                    return Err(Error::SpecifiedSchemaVersion(
+                        SchemaVersionError::TargetVersionOutOfRange {
+                            specified: target_version,
+                            highest: v_max,
+                        },
+                    ));
+                }
+
+                self.goto(db, target_version.into()).await
+            }
+            SchemaVersion::Outside(_) => unreachable!(),
+        }
+    }
+
+    fn db_version_to_schema(&self, db_version: usize) -> SchemaVersion {
+        match db_version {
+            0 => SchemaVersion::NoneSet,
+            v if v > 0 && v <= self.ms.len() => SchemaVersion::Inside(
+                NonZeroUsize::new(v).expect("schema version should not be equal to 0"),
+            ),
+            v => SchemaVersion::Outside(
+                NonZeroUsize::new(v).expect("schema version should not be equal to 0"),
+            ),
         }
     }
 
@@ -257,11 +389,54 @@ impl<'a> Migrations<'a> {
     /// All versions are db versions
     async fn goto_down<C: Connection>(
         &self,
-        _db: &Surreal<C>,
-        _current_version: usize,
-        _target_version: usize,
+        db: &Surreal<C>,
+        current_version: usize,
+        target_version: usize,
     ) -> Result<()> {
-        todo!()
+        debug_assert!(current_version >= target_version);
+        debug_assert!(target_version <= self.ms.len());
+
+        // First, check if all the migrations have a "down" version
+        if let Some((i, bad_m)) = self
+            .ms
+            .iter()
+            .enumerate()
+            .skip(target_version)
+            .take(current_version - target_version)
+            .find(|(_, m)| m.down.is_none())
+        {
+            warn!("Cannot revert: {:?}", bad_m);
+            return Err(Error::MigrationDefinition(
+                MigrationDefinitionError::DownNotDefined { migration_index: i },
+            ));
+        }
+
+        trace!("start migration transaction");
+
+        let mut queries = db.query("BEGIN;");
+
+        for v in (target_version..current_version).rev() {
+            let m = &self.ms[v];
+            if let Some(down) = m.down {
+                info!("Running: v{} {}", v + 1, m.comment.unwrap_or_default());
+
+                queries = queries
+                    .query(down)
+                    .query(format!(
+                        r#"
+                        DELETE _migrations WHERE version=$version_{v};"#
+                    ))
+                    .bind((format!("version_{v}"), v + 1))
+            } else {
+                unreachable!();
+            }
+        }
+
+        queries.query("COMMIT;").await?.check()?;
+
+        trace!("committed migration transaction");
+
+        Ok(())
     }
 
     /// Maximum version defined in the migration set
@@ -421,21 +596,21 @@ mod tests {
         assert_eq!(query_result[0].comment, "Create animal table");
         assert_eq!(
             query_result[0].checksum,
-            "4c2febc958756775b6f0fb01145674baded963d03c1aacea816ec4f61ee66ede"
+            "1bd55fce0e19a65fa868aba24e44a361713e6be5fe1a28d84fae0386a2781edd"
         );
 
         assert_eq!(query_result[1].version, 2);
         assert_eq!(query_result[1].comment, "");
         assert_eq!(
             query_result[1].checksum,
-            "ecc954865aba2afb559495875055b552320665d725c163b956a6aa349785a99e"
+            "59da625a9fe83055fbb5cd18ba1fdf0e4beebf64e13233d3252bc1b617493abc"
         );
 
         assert_eq!(query_result[2].version, 3);
         assert_eq!(query_result[2].comment, "");
         assert_eq!(
             query_result[2].checksum,
-            "1e46fb427cd9e10b9bd7f77a97e64739a64e43acb3dbe30243448311c47c8693"
+            "33e6cf4b20d211292ac1dab30f199fe290c66221ce10f31fc03d026f965b9c35"
         );
 
         let mut result = db
@@ -470,28 +645,28 @@ mod tests {
         assert_eq!(query_result[0].comment, "Create animal table");
         assert_eq!(
             query_result[0].checksum,
-            "4c2febc958756775b6f0fb01145674baded963d03c1aacea816ec4f61ee66ede"
+            "1bd55fce0e19a65fa868aba24e44a361713e6be5fe1a28d84fae0386a2781edd"
         );
 
         assert_eq!(query_result[1].version, 2);
         assert_eq!(query_result[1].comment, "");
         assert_eq!(
             query_result[1].checksum,
-            "ecc954865aba2afb559495875055b552320665d725c163b956a6aa349785a99e"
+            "59da625a9fe83055fbb5cd18ba1fdf0e4beebf64e13233d3252bc1b617493abc"
         );
 
         assert_eq!(query_result[2].version, 3);
         assert_eq!(query_result[2].comment, "");
         assert_eq!(
             query_result[2].checksum,
-            "1e46fb427cd9e10b9bd7f77a97e64739a64e43acb3dbe30243448311c47c8693"
+            "33e6cf4b20d211292ac1dab30f199fe290c66221ce10f31fc03d026f965b9c35"
         );
 
         assert_eq!(query_result[3].version, 4);
         assert_eq!(query_result[3].comment, "");
         assert_eq!(
             query_result[3].checksum,
-            "b0afb9a8540da6104dbed171693e8434057f21b839cec9d331771e5a5804d0c4"
+            "3d7a82ff33fae0322040f40cc3b93fdc6539c4e04e7d6153da5377f9d3c3408a"
         );
 
         let mut result = db
@@ -504,6 +679,100 @@ mod tests {
         assert_eq!(query_result[0], "dog");
         assert_eq!(query_result[1], "cat");
         assert_eq!(query_result[2], "horse");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_to_version() -> Result<()> {
+        let db = surrealdb::engine::any::connect((
+            "mem://",
+            surrealdb::opt::Config::new()
+                .set_strict(true)
+                .capabilities(surrealdb::dbs::Capabilities::all()),
+        ))
+        .await?;
+
+        db.query("DEFINE NAMESPACE test; USE NAMESPACE test; DEFINE DATABASE test;")
+            .await?
+            .check()?;
+
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![
+            // 0: version 0, before having run any migration
+            M::up("DEFINE TABLE animal SCHEMAFULL; DEFINE FIELD name ON animal TYPE string; DEFINE FIELD created_at ON animal TYPE datetime DEFAULT time::now()")
+                .down("REMOVE TABLE animal;")
+                .comment("Create animal table"),
+
+            // 1: version 1, after having created the “animals” table
+            M::up("DEFINE TABLE food SCHEMAFULL; DEFINE FIELD name ON food TYPE string; DEFINE FIELD created_at ON food TYPE datetime DEFAULT time::now()")
+                .down("REMOVE TABLE food;")
+                .comment("Create food table"),
+            // 2: version 2, after having created the food table
+        ]);
+
+        // create all tables
+        migrations.to_latest(&db).await?;
+
+        let version = get_current_version(&db).await?;
+        assert_eq!(version, 2);
+
+        // Go back to version 1, i.e. after running the first migration
+        migrations.to_version(&db, 1).await?;
+
+        let version = get_current_version(&db).await?;
+        assert_eq!(version, 1);
+
+        let mut result = db.query("SELECT count() from animal").await?.check()?;
+        let query_result: Option<u64> = result.take((0, "count"))?;
+        assert_eq!(query_result.unwrap_or_default(), 0);
+
+        db.query("INSERT INTO animal { name: 'dog' }")
+            .await?
+            .check()?;
+
+        let mut result = db.query("SELECT count() from animal").await?.check()?;
+        let query_result: Option<u64> = result.take((0, "count"))?;
+        assert_eq!(query_result.unwrap_or_default(), 1);
+
+        let result = db
+            .query("INSERT INTO food { name: 'carrot' }")
+            .await?
+            .check();
+
+        match result {
+            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
+                assert_eq!(value, "food")
+            }
+            _ => unreachable!(),
+        }
+
+        // Go back to an empty database
+        migrations.to_version(&db, 0).await?;
+
+        let version = get_current_version(&db).await?;
+        assert_eq!(version, 0);
+
+        let result = db
+            .query("INSERT INTO animal { name: 'cat' }")
+            .await?
+            .check();
+
+        match result {
+            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
+                assert_eq!(value, "animal")
+            }
+            _ => unreachable!(),
+        }
+
+        let result = db.query("INSERT INTO food { name: 'milk' }").await?.check();
+
+        match result {
+            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
+                assert_eq!(value, "food")
+            }
+            _ => unreachable!(),
+        }
 
         Ok(())
     }
