@@ -231,22 +231,22 @@ impl<'a> Migrations<'a> {
 
             queries = queries
                 .query(m.up)
-                .query(
+                .query(format!(
                     r#"
-                INSERT INTO _migrations {
-                    version: $version,
-                    comment: $comment,
-                    checksum: $checksum,
+                INSERT INTO _migrations {{
+                    version: $version_{v},
+                    comment: $comment_{v},
+                    checksum: $checksum_{v},
                     installed_on: time::now()
-                };
+                }};
                 "#,
-                )
-                .bind(("version", v + 1))
-                .bind(("comment", m.comment.unwrap_or_default()))
-                .bind(("checksum", m.checksum()));
+                ))
+                .bind((format!("version_{v}"), v + 1))
+                .bind((format!("comment_{v}"), m.comment.unwrap_or_default()))
+                .bind((format!("checksum_{v}"), m.checksum()));
         }
 
-        queries.query("COMMIT;").await?;
+        queries.query("COMMIT;").await?.check()?;
 
         trace!("committed migration transaction");
 
@@ -320,6 +320,18 @@ impl From<SchemaVersion> for usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use serde_json::Value;
+    use surrealdb::sql::{Datetime, Thing};
+
+    #[derive(Debug, Deserialize)]
+    pub struct MigrationRow {
+        pub id: Thing,
+        pub version: usize,
+        pub comment: String,
+        pub checksum: String,
+        pub installed_on: Datetime,
+    }
 
     #[tokio::test]
     async fn empty_db_should_have_version_0() -> Result<()> {
@@ -327,6 +339,164 @@ mod tests {
         db.use_ns("test").use_db("test").await?;
         let version = get_current_version(&db).await?;
         assert_eq!(version, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_with_no_migrations_defined_when_no_migrations() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![]);
+        let result = migrations.to_latest(&db).await;
+        matches!(
+            result,
+            Err(Error::MigrationDefinition(
+                MigrationDefinitionError::NoMigrationsDefined
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_migrations_table_is_created_when_run_migrations() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![]);
+        let _ = migrations.to_latest(&db).await;
+        let mut result = db.query("INFO FOR TABLE _migrations;").await?.check()?;
+        let result: Vec<Value> = result.take((0, "fields"))?;
+        assert_eq!(
+            &result[0]["checksum"],
+            "DEFINE FIELD checksum ON _migrations TYPE string PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["comment"],
+            "DEFINE FIELD comment ON _migrations TYPE string PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["installed_on"],
+            "DEFINE FIELD installed_on ON _migrations TYPE datetime PERMISSIONS FULL"
+        );
+        assert_eq!(
+            &result[0]["version"],
+            "DEFINE FIELD version ON _migrations TYPE number PERMISSIONS FULL"
+        );
+
+        let mut result = db.query("SELECT count() from _migrations").await?.check()?;
+        let query_result: Option<u64> = result.take((0, "count"))?;
+        assert_eq!(query_result.unwrap_or_default(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_to_latest() -> Result<()> {
+        let db = surrealdb::engine::any::connect("mem://").await?;
+        db.use_ns("test").use_db("test").await?;
+        let migrations = Migrations::new(vec![
+            M::up("DEFINE TABLE animal SCHEMAFULL; DEFINE FIELD name ON animal TYPE string; DEFINE FIELD created_at ON animal TYPE datetime DEFAULT time::now()")
+                .comment("Create animal table"),
+            M::up("INSERT INTO animal { name: 'dog' };"),
+            M::up("INSERT INTO animal { name: 'cat' };"),
+        ]);
+        migrations.to_latest(&db).await?;
+
+        let mut result = db
+            .query("SELECT * from _migrations ORDER BY version")
+            .await?
+            .check()?;
+        let query_result: Vec<MigrationRow> = result.take(0)?;
+
+        assert_eq!(query_result.len(), 3);
+
+        assert_eq!(query_result[0].version, 1);
+        assert_eq!(query_result[0].comment, "Create animal table");
+        assert_eq!(
+            query_result[0].checksum,
+            "4c2febc958756775b6f0fb01145674baded963d03c1aacea816ec4f61ee66ede"
+        );
+
+        assert_eq!(query_result[1].version, 2);
+        assert_eq!(query_result[1].comment, "");
+        assert_eq!(
+            query_result[1].checksum,
+            "ecc954865aba2afb559495875055b552320665d725c163b956a6aa349785a99e"
+        );
+
+        assert_eq!(query_result[2].version, 3);
+        assert_eq!(query_result[2].comment, "");
+        assert_eq!(
+            query_result[2].checksum,
+            "1e46fb427cd9e10b9bd7f77a97e64739a64e43acb3dbe30243448311c47c8693"
+        );
+
+        let mut result = db
+            .query("SELECT name, created_at from animal ORDER BY created_at")
+            .await?
+            .check()?;
+        let query_result: Vec<String> = result.take((0, "name"))?;
+
+        assert_eq!(query_result.len(), 2);
+        assert_eq!(query_result[0], "dog");
+        assert_eq!(query_result[1], "cat");
+
+        // run 2nd migration adding horse
+        let migrations = Migrations::new(vec![
+            M::up("DEFINE TABLE animal SCHEMAFULL; DEFINE FIELD name ON animal TYPE string;")
+                .comment("Create animal table"),
+            M::up("INSERT INTO animal { name: 'dog' };"),
+            M::up("INSERT INTO animal { name: 'cat' };"),
+            M::up("INSERT INTO animal { name: 'horse' };"),
+        ]);
+        migrations.to_latest(&db).await?;
+
+        let mut result = db
+            .query("SELECT * from _migrations ORDER BY version")
+            .await?
+            .check()?;
+        let query_result: Vec<MigrationRow> = result.take(0)?;
+
+        assert_eq!(query_result.len(), 4);
+
+        assert_eq!(query_result[0].version, 1);
+        assert_eq!(query_result[0].comment, "Create animal table");
+        assert_eq!(
+            query_result[0].checksum,
+            "4c2febc958756775b6f0fb01145674baded963d03c1aacea816ec4f61ee66ede"
+        );
+
+        assert_eq!(query_result[1].version, 2);
+        assert_eq!(query_result[1].comment, "");
+        assert_eq!(
+            query_result[1].checksum,
+            "ecc954865aba2afb559495875055b552320665d725c163b956a6aa349785a99e"
+        );
+
+        assert_eq!(query_result[2].version, 3);
+        assert_eq!(query_result[2].comment, "");
+        assert_eq!(
+            query_result[2].checksum,
+            "1e46fb427cd9e10b9bd7f77a97e64739a64e43acb3dbe30243448311c47c8693"
+        );
+
+        assert_eq!(query_result[3].version, 4);
+        assert_eq!(query_result[3].comment, "");
+        assert_eq!(
+            query_result[3].checksum,
+            "b0afb9a8540da6104dbed171693e8434057f21b839cec9d331771e5a5804d0c4"
+        );
+
+        let mut result = db
+            .query("SELECT name, created_at from animal ORDER BY created_at")
+            .await?
+            .check()?;
+        let query_result: Vec<String> = result.take((0, "name"))?;
+
+        assert_eq!(query_result.len(), 3);
+        assert_eq!(query_result[0], "dog");
+        assert_eq!(query_result[1], "cat");
+        assert_eq!(query_result[2], "horse");
+
         Ok(())
     }
 }
