@@ -42,8 +42,10 @@ jobs:
         with:
           command: build
           args: --verbose --locked --all --release
-      - name: Run test
-        run: cargo test --all
+      - name: Run test with no features
+        run: cargo test
+      - name: Run test with from-directory feature
+        run: cargo test --features=from-directory
 
   publish_crate:
     if: startsWith(github.ref, 'refs/tags/')
