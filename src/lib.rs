@@ -179,36 +179,36 @@ impl<'a> Migrations<'a> {
     /// subdirectories in accordance with the given pattern:
     /// `{usize id indicating the order}-{convenient migration name}`
     ///
-    /// Those directories must contain at lest an `up.sql` file containing a valid upward
-    /// migration. They can also contain a `down.sql` file containing a downward migration.
+    /// Those directories must contain at least an `up.surql` file containing a valid upward
+    /// migration. They can also contain a `down.surql` file containing a downward migration.
     ///
     /// ## Example structure
     ///
     /// ```no_test
     /// migrations
     /// ├── 01-friend_car
-    /// │  └── up.sql
+    /// │  └── up.surql
     /// ├── 02-add_birthday_column
-    /// │  └── up.sql
+    /// │  └── up.surql
     /// └── 03-add_animal_table
-    ///    ├── down.sql
-    ///    └── up.sql
+    ///    ├── down.surql
+    ///    └── up.surql
     /// ```
     ///
     /// # Example
     ///
-    /// ```
-    /// use rusqlite_migration::Migrations;
+    /// ```no_test
+    /// use surrealdb_migration::Migrations;
     /// use include_dir::{Dir, include_dir};
     ///
-    /// static MIGRATION_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../examples/from-directory/migrations");
+    /// static MIGRATION_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
     /// let migrations = Migrations::from_directory(&MIGRATION_DIR).unwrap();
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`Error::FileLoad`] in case the subdirectory names are incorrect,
-    /// or don't contain at least a valid `up.sql` file.
+    /// or don't contain at least a valid `up.surql` file.
     #[cfg(feature = "from-directory")]
     pub fn from_directory(dir: &'static Dir<'static>) -> Result<Self> {
         let migrations = from_directory(dir)?
@@ -558,6 +558,7 @@ impl<'u> FromIterator<M<'u>> for Migrations<'u> {
     }
 }
 
+#[cfg(feature = "from-directory")]
 mod loader {
     use std::{convert::TryFrom, num::NonZeroUsize};
 
@@ -589,21 +590,21 @@ mod loader {
     ) -> Result<(&'static str, Option<&'static str>)> {
         let up = value
             .files()
-            .find(|f| f.path().ends_with("up.sql"))
+            .find(|f| f.path().ends_with("up.surql"))
             .ok_or(Error::FileLoad(format!(
                 "Missing upward migration file for migration {name}"
             )))?
             .contents_utf8()
             .ok_or(Error::FileLoad(format!(
-                "Could not load contents from {name}/up.sql"
+                "Could not load contents from {name}/up.surql"
             )))?;
 
         let down = value
             .files()
-            .find(|f| f.path().ends_with("down.sql"))
+            .find(|f| f.path().ends_with("down.surql"))
             .map(|down| {
                 down.contents_utf8().ok_or(Error::FileLoad(format!(
-                    "Could not load contents from {name}/down.sql"
+                    "Could not load contents from {name}/down.surql"
                 )))
             })
             .transpose()?;
@@ -689,6 +690,37 @@ mod loader {
 
         // The values are returned in the order of the keys, i.e. of IDs
         Ok(migrations)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::*;
+        use include_dir::{include_dir, Dir};
+
+        static MIGRATION_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
+
+        #[tokio::test]
+        async fn from_directory_tests() -> Result<()> {
+            let migrations = Migrations::from_directory(&MIGRATION_DIR).unwrap();
+            let db = surrealdb::engine::any::connect((
+                "mem://",
+                surrealdb::opt::Config::new()
+                    .set_strict(true)
+                    .capabilities(surrealdb::dbs::Capabilities::all()),
+            ))
+            .await?;
+
+            db.query("DEFINE NAMESPACE test; USE NAMESPACE test; DEFINE DATABASE test;")
+                .await?
+                .check()?;
+
+            db.use_ns("test").use_db("test").await?;
+            migrations.to_latest(&db).await?;
+
+            let version = get_current_version(&db).await?;
+            assert_eq!(version, 3);
+            Ok(())
+        }
     }
 }
 
