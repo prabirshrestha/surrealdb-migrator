@@ -11,15 +11,18 @@ cargo add surrealdb-migrator
 ```rust
 use surrealdb_migrator::{Migrations, M};
 
-let db = surrealdb::engine::any::connect("...connection string...");
+let db = surrealdb::engine::any::connect("mem://");
 
 let migrations = Migrations::new(vec![
-    M::up("DEFINE TABLE user; DEFINE FIELD username ON user TYPE string;"),
-    M::up("DEFINE FIELD password ON user TYPE string;"),
+    M::up("DEFINE TABLE animal; DEFINE FIELD name ON animal TYPE string;").down("REMOVE TABLE user;"),
+    M::up("DEFINE TABLE food; DEFINE FIELD name ON food TYPE string;").down("REMOVE TABLE food;"),
 ]);
 
 // Go to the latest version
 migrations.to_latest(&db).unwrap();
+
+// Go to a specific version
+migrations.to_version(&db, 0).unwrap();
 ```
 
 # LICENSE
