@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, num::NonZeroUsize};
+use std::{
+    cmp::{self, Ordering},
+    num::NonZeroUsize,
+};
 
 use surrealdb::{Connection, Surreal};
 use tracing::{debug, info, trace, warn};
@@ -17,11 +20,29 @@ pub enum Error {
         /// Error returned by surrealdb
         err: surrealdb::Error,
     },
+    #[error("Specified schema version error")]
+    /// Error with the specified schema version
+    SpecifiedSchemaVersion(SchemaVersionError),
     #[error("Migration definition error")]
     /// Something wrong with migration definitions
     MigrationDefinition(MigrationDefinitionError),
     #[error("Unrecognized error")]
     Unrecognized(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+/// Errors related to schema versions
+#[derive(thiserror::Error, Debug)]
+#[allow(clippy::enum_variant_names)]
+#[non_exhaustive]
+pub enum SchemaVersionError {
+    /// Attempt to migrate to a version out of range for the supplied migrations
+    #[error("Target version out of range")]
+    TargetVersionOutOfRange {
+        /// The attempt to migrate to this version caused the error
+        specified: SchemaVersion,
+        /// Highest version defined in the migration set
+        highest: SchemaVersion,
+    },
 }
 
 impl From<surrealdb::Error> for Error {
@@ -87,6 +108,15 @@ impl<'a> M<'a> {
     }
 }
 
+impl cmp::PartialOrd for SchemaVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let self_usize: usize = self.into();
+        let other_usize: usize = other.into();
+
+        self_usize.partial_cmp(&other_usize)
+    }
+}
+
 /// Set of migrations
 #[derive(Debug)]
 pub struct Migrations<'a> {
@@ -147,6 +177,88 @@ impl<'a> Migrations<'a> {
                 self.goto(db, v_max.into()).await
             }
             SchemaVersion::Outside(_) => unreachable!(),
+        }
+    }
+
+    /// Migrate the database to a given schema version. The migrations are applied atomically.
+    ///
+    /// # Specifying versions
+    ///
+    /// - Empty database (no migrations run yet) has version `0`.
+    /// - The version increases after each migration, so after the first migration has run, the schema version is `1`. For instance, if there are 3 migrations, version `3` is after all migrations have run.
+    ///
+    /// *Note*: As a result, the version is the index in the migrations vector *starting from 1*.
+    ///
+    /// # Example
+    ///
+    /// ```no_test
+    /// use surrealdb_migration::{Migrations, M};
+    ///
+    /// let db = surrealdb::engine::any::connect("file://data.db");
+    /// let migrations = Migrations::new(vec![
+    ///     // 0: version 0, before having run any migration
+    ///     M::up("DEFINE TABLE animal; DEFINE FIELD name on animal TYPE string;").down("DROP TABLE animal;"),
+    ///     // 1: version 1, after having created the “animals” table
+    ///     M::up("DEFINE TABLE food; DEFINE FIELD name on food TYPE string;").down("DROP TABLE food;"),
+    ///     // 2: version 2, after having created the food table
+    /// ]);
+    ///
+    /// migrations.to_latest(&db).unwrap(); // Create all tables
+    ///
+    /// // Go back to version 1, i.e. after running the first migration
+    /// migrations.to_version(&db, 1);
+    /// db.query("INSERT INTO animal { name: 'dog' }").await?.check()?;
+    /// db.query("INSERT INTO food { name: 'carrot' }").await?.check()?;
+    ///
+    /// // Go back to an empty database
+    /// migrations.to_version(&db, 0);
+    /// db.query("INSERT INTO animal { name: 'cat' }").await?.check()?;
+    /// db.query("INSERT INTO food { name: 'milk' }").await?.check()?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Attempts to migrate to a higher version than is supported will result in an error.
+    ///
+    /// When migrating downwards, all the reversed migrations must have a `.down()` variant,
+    /// otherwise no migrations are run and the function returns an error.
+    pub async fn to_version<C: Connection>(&self, db: &Surreal<C>, version: usize) -> Result<()> {
+        let target_version: SchemaVersion = self.db_version_to_schema(version);
+        let v_max = self.max_schema_version();
+        match v_max {
+            SchemaVersion::NoneSet => {
+                warn!("no migrations defined");
+                Err(Error::MigrationDefinition(
+                    MigrationDefinitionError::NoMigrationsDefined,
+                ))
+            }
+            SchemaVersion::Inside(v) => {
+                debug!("some migrations defined (version: {v}), try to migrate");
+                if target_version > v_max {
+                    warn!("specified version is higher than the max supported version");
+                    return Err(Error::SpecifiedSchemaVersion(
+                        SchemaVersionError::TargetVersionOutOfRange {
+                            specified: target_version,
+                            highest: v_max,
+                        },
+                    ));
+                }
+
+                self.goto(db, target_version.into()).await
+            }
+            SchemaVersion::Outside(_) => unreachable!(),
+        }
+    }
+
+    fn db_version_to_schema(&self, db_version: usize) -> SchemaVersion {
+        match db_version {
+            0 => SchemaVersion::NoneSet,
+            v if v > 0 && v <= self.ms.len() => SchemaVersion::Inside(
+                NonZeroUsize::new(v).expect("schema version should not be equal to 0"),
+            ),
+            v => SchemaVersion::Outside(
+                NonZeroUsize::new(v).expect("schema version should not be equal to 0"),
+            ),
         }
     }
 
