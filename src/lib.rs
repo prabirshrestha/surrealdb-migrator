@@ -3,6 +3,12 @@ use std::{
     num::NonZeroUsize,
 };
 
+#[cfg(feature = "from-directory")]
+use include_dir::Dir;
+
+#[cfg(feature = "from-directory")]
+use loader::from_directory;
+
 use surrealdb::{Connection, Surreal};
 use tracing::{debug, info, trace, warn};
 
@@ -26,6 +32,9 @@ pub enum Error {
     #[error("Migration definition error")]
     /// Something wrong with migration definitions
     MigrationDefinition(MigrationDefinitionError),
+    #[error("File load error")]
+    /// Error returned when loading migrations from directory
+    FileLoad(String),
     #[error("Unrecognized error")]
     Unrecognized(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
@@ -72,7 +81,7 @@ pub enum MigrationDefinitionError {
 }
 
 /// One migration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct M<'a> {
     up: &'a str,
     down: Option<&'a str>,
@@ -159,6 +168,55 @@ impl<'a> Migrations<'a> {
     #[must_use]
     pub fn new(ms: Vec<M<'a>>) -> Self {
         Migrations { ms }
+    }
+
+    /// Creates a set of migrations from a given directory by scanning subdirectories with a specified name pattern.
+    /// The migrations are loaded and stored in the binary.
+    ///
+    /// # Directory Structure Requirements
+    ///
+    /// The migration directory pointed to by `include_dir!()` must contain
+    /// subdirectories in accordance with the given pattern:
+    /// `{usize id indicating the order}-{convenient migration name}`
+    ///
+    /// Those directories must contain at lest an `up.sql` file containing a valid upward
+    /// migration. They can also contain a `down.sql` file containing a downward migration.
+    ///
+    /// ## Example structure
+    ///
+    /// ```no_test
+    /// migrations
+    /// ├── 01-friend_car
+    /// │  └── up.sql
+    /// ├── 02-add_birthday_column
+    /// │  └── up.sql
+    /// └── 03-add_animal_table
+    ///    ├── down.sql
+    ///    └── up.sql
+    /// ```
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rusqlite_migration::Migrations;
+    /// use include_dir::{Dir, include_dir};
+    ///
+    /// static MIGRATION_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../examples/from-directory/migrations");
+    /// let migrations = Migrations::from_directory(&MIGRATION_DIR).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileLoad`] in case the subdirectory names are incorrect,
+    /// or don't contain at least a valid `up.sql` file.
+    #[cfg(feature = "from-directory")]
+    pub fn from_directory(dir: &'static Dir<'static>) -> Result<Self> {
+        let migrations = from_directory(dir)?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::FileLoad("Could not load migrations".to_string()))?;
+
+        Ok(Self { ms: migrations })
     }
 
     /// Migrate the database to latest schema version. The migrations are applied atomically.
@@ -497,6 +555,140 @@ impl<'u> FromIterator<M<'u>> for Migrations<'u> {
         Self {
             ms: Vec::from_iter(iter),
         }
+    }
+}
+
+mod loader {
+    use std::{convert::TryFrom, num::NonZeroUsize};
+
+    use crate::{Error, Result, M};
+    use include_dir::Dir;
+
+    #[derive(Debug, Clone)]
+    struct MigrationFile {
+        id: NonZeroUsize,
+        name: &'static str,
+        up: &'static str,
+        down: Option<&'static str>,
+    }
+
+    fn get_name(value: &'static Dir<'static>) -> Result<&'static str> {
+        value
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::FileLoad(format!(
+                "Could not extract file name from {:?}",
+                value.path()
+            )))
+    }
+
+    fn get_migrations(
+        name: &'static str,
+        value: &'static Dir<'static>,
+    ) -> Result<(&'static str, Option<&'static str>)> {
+        let up = value
+            .files()
+            .find(|f| f.path().ends_with("up.sql"))
+            .ok_or(Error::FileLoad(format!(
+                "Missing upward migration file for migration {name}"
+            )))?
+            .contents_utf8()
+            .ok_or(Error::FileLoad(format!(
+                "Could not load contents from {name}/up.sql"
+            )))?;
+
+        let down = value
+            .files()
+            .find(|f| f.path().ends_with("down.sql"))
+            .map(|down| {
+                down.contents_utf8().ok_or(Error::FileLoad(format!(
+                    "Could not load contents from {name}/down.sql"
+                )))
+            })
+            .transpose()?;
+
+        Ok((up, down))
+    }
+
+    fn get_id(file_name: &'static str) -> Result<NonZeroUsize> {
+        file_name
+            .split_once('-')
+            .ok_or(Error::FileLoad(format!(
+                "Could not extract migration id from file name {file_name}"
+            )))?
+            .0
+            .parse::<usize>()
+            .map_err(|e| {
+                Error::FileLoad(format!(
+                    "Could not parse migration id from file name {file_name} as usize: {e}"
+                ))
+            })
+            .and_then(|v| {
+                NonZeroUsize::new(v).ok_or(Error::FileLoad(format!(
+                    "{file_name} has an incorrect migration id: migration id cannot be 0"
+                )))
+            })
+    }
+
+    impl TryFrom<&'static Dir<'static>> for MigrationFile {
+        type Error = Error;
+
+        fn try_from(value: &'static Dir<'static>) -> std::result::Result<Self, Self::Error> {
+            let name = get_name(value)?;
+            let (up, down) = get_migrations(name, value)?;
+            let id = get_id(name)?;
+
+            Ok(MigrationFile { id, name, up, down })
+        }
+    }
+
+    impl<'u> From<&MigrationFile> for M<'u> {
+        fn from(value: &MigrationFile) -> Self {
+            M::up(value.up)
+                .comment(value.name)
+                .down(value.down.unwrap_or_default())
+        }
+    }
+
+    pub(crate) fn from_directory(dir: &'static Dir<'static>) -> Result<Vec<Option<M<'static>>>> {
+        let mut migrations: Vec<Option<M>> = vec![None; dir.dirs().count()];
+
+        for dir in dir.dirs() {
+            let migration_file = MigrationFile::try_from(dir)?;
+
+            let id = usize::from(migration_file.id) - 1;
+
+            if migrations.len() <= id {
+                return Err(Error::FileLoad(
+                    "Migration ids must be consecutive numbers".to_string(),
+                ));
+            }
+
+            if migrations[id].is_some() {
+                return Err(Error::FileLoad(format!(
+                    "Multiple migrations detected for migration id: {}",
+                    migration_file.id
+                )));
+            }
+
+            migrations[id] = Some((&migration_file).into());
+        }
+
+        if migrations.iter().all(|m| m.is_none()) {
+            return Err(Error::FileLoad(
+                "Directory does not contain any migration files".to_string(),
+            ));
+        }
+
+        if migrations.iter().any(|m| m.is_none()) {
+            return Err(Error::FileLoad(
+                "Migration ids must be consecutive numbers".to_string(),
+            ));
+        }
+
+        // The values are returned in the order of the keys, i.e. of IDs
+        Ok(migrations)
     }
 }
 
