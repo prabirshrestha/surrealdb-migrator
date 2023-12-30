@@ -32,7 +32,7 @@ pub enum Error {
     #[error("Migration definition error")]
     /// Something wrong with migration definitions
     MigrationDefinition(MigrationDefinitionError),
-    #[error("File load error")]
+    #[error("File load error: {0}")]
     /// Error returned when loading migrations from directory
     FileLoad(String),
     #[error("Unrecognized error")]
