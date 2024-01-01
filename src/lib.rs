@@ -1,5 +1,6 @@
 use std::{
     cmp::{self, Ordering},
+    fmt,
     num::NonZeroUsize,
 };
 
@@ -18,7 +19,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Enum listing possible errors.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("Surreldb error")]
+    #[error("Surreldb error: {query} {err}")]
     /// Surrealdb error, query may indicate the attempted SQL query
     SurrealdbError {
         /// SQL query that caused the error
@@ -26,16 +27,16 @@ pub enum Error {
         /// Error returned by surrealdb
         err: surrealdb::Error,
     },
-    #[error("Specified schema version error")]
+    #[error("Specified schema version error: {0}")]
     /// Error with the specified schema version
     SpecifiedSchemaVersion(SchemaVersionError),
-    #[error("Migration definition error")]
+    #[error("Migration definition error: {0}")]
     /// Something wrong with migration definitions
     MigrationDefinition(MigrationDefinitionError),
     #[error("File load error: {0}")]
     /// Error returned when loading migrations from directory
     FileLoad(String),
-    #[error("Unrecognized error")]
+    #[error("Unrecognized error: {0}")]
     Unrecognized(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
@@ -45,7 +46,7 @@ pub enum Error {
 #[non_exhaustive]
 pub enum SchemaVersionError {
     /// Attempt to migrate to a version out of range for the supplied migrations
-    #[error("Target version out of range")]
+    #[error("Target version out of range: specified: specified={specified} highest={highest}")]
     TargetVersionOutOfRange {
         /// The attempt to migrate to this version caused the error
         specified: SchemaVersion,
@@ -532,6 +533,16 @@ pub enum SchemaVersion {
     Inside(NonZeroUsize),
     /// The current version in the database is outside any migration defined
     Outside(NonZeroUsize),
+}
+
+impl fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchemaVersion::NoneSet => write!(f, "0 (no version set)"),
+            SchemaVersion::Inside(v) => write!(f, "{v} (inside)"),
+            SchemaVersion::Outside(v) => write!(f, "{v} (outside)"),
+        }
+    }
 }
 
 impl From<&SchemaVersion> for usize {
