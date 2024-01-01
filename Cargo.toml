@@ -1,6 +1,6 @@
 [package]
 name = "surrealdb-migrator"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["Prabir Shrestha <mail@prabir.me>"]
 edition = "2021"
 license = "Apache-2.0"
