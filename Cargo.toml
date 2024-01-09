@@ -18,12 +18,12 @@ from-directory = ["dep:include_dir"]
 [dependencies]
 include_dir = { version = "0.7.3", optional = true }
 sha256 = "1.5.0"
-surrealdb = "1.0.2"
+surrealdb = "1.1.0"
 thiserror = "1.0.53"
 tracing = "0.1.40"
 
 [dev-dependencies]
 tokio = { version = "1.35.1", features = [ "macros", "rt" ] }
-surrealdb = { version = "1.0.2", features = [ "kv-mem" ] }
+surrealdb = { version = "1.1.0", features = [ "kv-mem" ] }
 serde = { version = "1.0.195", features = [ "derive" ] }
 serde_json = "1.0"
