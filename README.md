@@ -13,7 +13,9 @@ cargo add surrealdb-migrator
 ```rust
 use surrealdb_migrator::{Migrations, M};
 
-let db = surrealdb::engine::any::connect("mem://");
+let db = surrealdb::engine::any::connect("mem://").unwrap();
+
+db.use_ns("sample").use_db("sample").await.unwrap();
 
 let migrations = Migrations::new(vec![
     M::up("DEFINE TABLE animal; DEFINE FIELD name ON animal TYPE string;").down("REMOVE TABLE user;"),
