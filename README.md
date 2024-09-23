@@ -65,8 +65,8 @@ migrations.to_latest(&db).await?;
 
 surrealdb-migrator version  | surrealdb version
 ----------------------------|------------------
-`0.1.8`                     | `>= 1.5.0  < 2.x`
-`0.2.x`                     | `>=2.0.0   < 3.x`
+`0.1.8`                     | `>= 1.5.0  && < 2.x`
+`0.2.x`                     | `>= 2.0.0  && < 3.x`
 
 # LICENSE
 
