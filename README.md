@@ -61,7 +61,7 @@ let migrations = Migrations::from_directory(&MIGRATION_DIR).unwrap();
 migrations.to_latest(&db).await?;
 ```
 
-# Surrealdb Compatiblitiy
+# Surrealdb Compatibility
 
 surrealdb-migrator version  | surrealdb version
 ----------------------------|------------------
