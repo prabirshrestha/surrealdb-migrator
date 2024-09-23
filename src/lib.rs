@@ -346,12 +346,12 @@ impl<'a> Migrations<'a> {
 
         db.query(
             r#"
-    DEFINE TABLE _migrations SCHEMAFULL;
-    DEFINE FIELD version                    ON _migrations TYPE number;
-    DEFINE FIELD comment                    ON _migrations TYPE string;
-    DEFINE FIELD checksum                   ON _migrations TYPE string;
-    DEFINE FIELD installed_on               ON _migrations TYPE datetime;
-    DEFINE INDEX _migrations_version_idx    ON TABLE _migrations COLUMNS version UNIQUE;
+    DEFINE TABLE IF NOT EXISTS _migrations SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS version                    ON _migrations TYPE number;
+    DEFINE FIELD IF NOT EXISTS comment                    ON _migrations TYPE string;
+    DEFINE FIELD IF NOT EXISTS checksum                   ON _migrations TYPE string;
+    DEFINE FIELD IF NOT EXISTS installed_on               ON _migrations TYPE datetime;
+    DEFINE INDEX IF NOT EXISTS _migrations_version_idx    ON TABLE _migrations COLUMNS version UNIQUE;
             "#,
         )
         .await?
@@ -433,7 +433,10 @@ impl<'a> Migrations<'a> {
                 "#,
                 ))
                 .bind((format!("version_{v}"), v + 1))
-                .bind((format!("comment_{v}"), m.comment.unwrap_or_default()))
+                .bind((
+                    format!("comment_{v}"),
+                    m.comment.unwrap_or_default().to_owned(),
+                ))
                 .bind((format!("checksum_{v}"), m.checksum()));
         }
 
@@ -717,7 +720,7 @@ mod loader {
                 "mem://",
                 surrealdb::opt::Config::new()
                     .set_strict(true)
-                    .capabilities(surrealdb::dbs::Capabilities::all()),
+                    .capabilities(surrealdb::opt::capabilities::Capabilities::all()),
             ))
             .await?;
 
@@ -924,7 +927,7 @@ mod tests {
             "mem://",
             surrealdb::opt::Config::new()
                 .set_strict(true)
-                .capabilities(surrealdb::dbs::Capabilities::all()),
+                .capabilities(surrealdb::opt::capabilities::Capabilities::all()),
         ))
         .await?;
 
