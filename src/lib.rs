@@ -413,17 +413,19 @@ impl<'a> Migrations<'a> {
 
         trace!("start migration");
 
-        let mut queries = db.query("BEGIN;");
+        let mut sql = String::from("BEGIN;\n");
 
         for v in current_version..target_version {
             let m = &self.ms[v];
             info!("Running: v{} {}", v + 1, m.comment.unwrap_or_default());
             debug!("{}", m.up);
 
-            queries = queries
-                .query(m.up)
-                .query(format!(
-                    r#"
+            sql.push_str(m.up);
+            if !m.up.trim_end().ends_with(';') {
+                sql.push(';');
+            }
+            sql.push_str(&format!(
+                r#"
                 INSERT INTO _migrations {{
                     version: $version_{v},
                     comment: $comment_{v},
@@ -431,7 +433,15 @@ impl<'a> Migrations<'a> {
                     installed_on: time::now()
                 }};
                 "#,
-                ))
+            ));
+        }
+
+        sql.push_str("COMMIT;");
+
+        let mut query = db.query(&sql);
+        for v in current_version..target_version {
+            let m = &self.ms[v];
+            query = query
                 .bind((format!("version_{v}"), v + 1))
                 .bind((
                     format!("comment_{v}"),
@@ -440,7 +450,7 @@ impl<'a> Migrations<'a> {
                 .bind((format!("checksum_{v}"), m.checksum()));
         }
 
-        queries.query("COMMIT;").await?.check()?;
+        query.await?.check()?;
 
         trace!("committed migration transaction");
 
@@ -475,26 +485,34 @@ impl<'a> Migrations<'a> {
 
         trace!("start migration transaction");
 
-        let mut queries = db.query("BEGIN;");
+        let mut sql = String::from("BEGIN;\n");
 
         for v in (target_version..current_version).rev() {
             let m = &self.ms[v];
             if let Some(down) = m.down {
                 info!("Running: v{} {}", v + 1, m.comment.unwrap_or_default());
 
-                queries = queries
-                    .query(down)
-                    .query(format!(
-                        r#"
-                        DELETE _migrations WHERE version=$version_{v};"#
-                    ))
-                    .bind((format!("version_{v}"), v + 1))
+                sql.push_str(down);
+                if !down.trim_end().ends_with(';') {
+                    sql.push(';');
+                }
+                sql.push_str(&format!(
+                    r#"
+                    DELETE _migrations WHERE version=$version_{v};"#
+                ));
             } else {
                 unreachable!();
             }
         }
 
-        queries.query("COMMIT;").await?.check()?;
+        sql.push_str("COMMIT;");
+
+        let mut query = db.query(&sql);
+        for v in (target_version..current_version).rev() {
+            query = query.bind((format!("version_{v}"), v + 1));
+        }
+
+        query.await?.check()?;
 
         trace!("committed migration transaction");
 
@@ -514,15 +532,32 @@ impl<'a> Migrations<'a> {
 
 // Read user version field from the db
 async fn get_current_version<C: Connection>(db: &Surreal<C>) -> Result<usize, surrealdb::Error> {
-    let mut result = db
+    let result = db
         .query(r#"SELECT version FROM _migrations ORDER BY version DESC LIMIT 1"#)
-        .await?
-        .check()?;
+        .await;
 
-    let query_result: Option<usize> = result.take((0, "version"))?;
-    match query_result {
-        Some(version) => Ok(version),
-        None => Ok(0),
+    match result {
+        Ok(result) => match result.check() {
+            Ok(mut result) => {
+                let query_result: Option<usize> = result.take((0, "version"))?;
+                Ok(query_result.unwrap_or(0))
+            }
+            Err(e) => {
+                // Table doesn't exist yet - return version 0
+                if e.message().contains("does not exist") {
+                    Ok(0)
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        Err(e) => {
+            if e.message().contains("does not exist") {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -716,17 +751,7 @@ mod loader {
         #[tokio::test]
         async fn from_directory_tests() -> Result<()> {
             let migrations = Migrations::from_directory(&MIGRATION_DIR).unwrap();
-            let db = surrealdb::engine::any::connect((
-                "mem://",
-                surrealdb::opt::Config::new()
-                    .set_strict(true)
-                    .capabilities(surrealdb::opt::capabilities::Capabilities::all()),
-            ))
-            .await?;
-
-            db.query("DEFINE NAMESPACE test; USE NAMESPACE test; DEFINE DATABASE test;")
-                .await?
-                .check()?;
+            let db = surrealdb::engine::any::connect("mem://").await?;
 
             db.use_ns("test").use_db("test").await?;
             migrations.to_latest(&db).await?;
@@ -741,13 +766,12 @@ mod loader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
     use serde_json::Value;
-    use surrealdb::sql::{Datetime, Thing};
+    use surrealdb::types::{Datetime, RecordId, SurrealValue};
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, SurrealValue)]
     pub struct MigrationRow {
-        pub id: Thing,
+        pub id: RecordId,
         pub version: usize,
         pub comment: String,
         pub checksum: String,
@@ -923,17 +947,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_to_version() -> Result<()> {
-        let db = surrealdb::engine::any::connect((
-            "mem://",
-            surrealdb::opt::Config::new()
-                .set_strict(true)
-                .capabilities(surrealdb::opt::capabilities::Capabilities::all()),
-        ))
-        .await?;
-
-        db.query("DEFINE NAMESPACE test; USE NAMESPACE test; DEFINE DATABASE test;")
-            .await?
-            .check()?;
+        let db = surrealdb::engine::any::connect("mem://").await?;
 
         db.use_ns("test").use_db("test").await?;
         let migrations = Migrations::new(vec![
@@ -973,17 +987,18 @@ mod tests {
         let query_result: Option<u64> = result.take((0, "count"))?;
         assert_eq!(query_result.unwrap_or_default(), 1);
 
-        let result = db
-            .query("INSERT INTO food { name: 'carrot' }")
-            .await?
-            .check();
-
-        match result {
-            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
-                assert_eq!(value, "food")
-            }
-            _ => unreachable!(),
-        }
+        // Verify food table was removed (not in INFO FOR DB)
+        let mut result = db.query("INFO FOR DB;").await?.check()?;
+        let info: Option<serde_json::Value> = result.take(0)?;
+        let tables = info
+            .as_ref()
+            .and_then(|v| v.get("tables"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert!(
+            !tables.as_object().map_or(false, |t| t.contains_key("food")),
+            "food table should not exist after rollback to version 1"
+        );
 
         // Go back to an empty database
         migrations.to_version(&db, 0).await?;
@@ -991,26 +1006,24 @@ mod tests {
         let version = get_current_version(&db).await?;
         assert_eq!(version, 0);
 
-        let result = db
-            .query("INSERT INTO animal { name: 'cat' }")
-            .await?
-            .check();
-
-        match result {
-            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
-                assert_eq!(value, "animal")
-            }
-            _ => unreachable!(),
-        }
-
-        let result = db.query("INSERT INTO food { name: 'milk' }").await?.check();
-
-        match result {
-            Err(surrealdb::Error::Db(surrealdb::error::Db::TbNotFound { value })) => {
-                assert_eq!(value, "food")
-            }
-            _ => unreachable!(),
-        }
+        // Verify animal table was removed
+        let mut result = db.query("INFO FOR DB;").await?.check()?;
+        let info: Option<serde_json::Value> = result.take(0)?;
+        let tables = info
+            .as_ref()
+            .and_then(|v| v.get("tables"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert!(
+            !tables
+                .as_object()
+                .map_or(false, |t| t.contains_key("animal")),
+            "animal table should not exist after rollback to version 0"
+        );
+        assert!(
+            !tables.as_object().map_or(false, |t| t.contains_key("food")),
+            "food table should not exist after rollback to version 0"
+        );
 
         Ok(())
     }
